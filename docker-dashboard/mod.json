@@ -1,0 +1,10 @@
+{
+  "place": "none",
+  "title": "Docker Dashboard",
+  "focusable": true,
+  "overlay": {
+    "width": 840,
+    "height": 650,
+    "kind": "dialog"
+  }
+}

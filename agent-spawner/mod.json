@@ -1,0 +1,9 @@
+{
+  "title": "Agent Spawner",
+  "place": "none",
+  "overlay": {
+    "kind": "dialog",
+    "width": 660,
+    "height": 760
+  }
+}

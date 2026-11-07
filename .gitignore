@@ -1,0 +1,6 @@
+*.d.ts
+jsconfig.json
+agent-spawner/docker/agy
+.DS_Store
+*.log
+
