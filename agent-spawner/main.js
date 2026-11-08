@@ -124,17 +124,6 @@ function shellEscapeSingle(s) {
   return "'" + String(s).replace(/'/g, "'\\''") + "'";
 }
 
-function quoteForShell(arg) {
-  if (typeof arg !== "string") return String(arg);
-  if ((arg.startsWith("'") && arg.endsWith("'")) || (arg.startsWith('"') && arg.endsWith('"'))) {
-    return arg;
-  }
-  if (/[\s;|<>&"'${}]/.test(arg)) {
-    return "'" + arg.replace(/'/g, "'\\''") + "'";
-  }
-  return arg;
-}
-
 function getDockerMountPath(raw) {
   const p = sanitizePath(raw);
   const wslMatch = p.match(/^(?:\\\\wsl\.localhost|\\\\wsl\$)\\([^\\]+)\\(.*)$/i);
@@ -1219,9 +1208,6 @@ export default class AgentSpawner extends View {
         finalArgv = ["wsl.exe", "-d", distro, "--cd", linuxPath, "-e", ...finalArgv];
       }
     }
-
-    // Safely quote arguments for host interactive shell (PowerShell / bash)
-    finalArgv = finalArgv.map(quoteForShell);
 
     // Save history & preferences
     if (task) {
