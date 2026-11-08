@@ -97,6 +97,29 @@ function sanitizePath(raw) {
   return p;
 }
 
+function toBase64(str) {
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(str, "utf8").toString("base64");
+  }
+  if (typeof btoa === "function") {
+    return btoa(unescape(encodeURIComponent(str)));
+  }
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let encoded = "";
+  let i = 0;
+  const bytes = new TextEncoder().encode(str);
+  while (i < bytes.length) {
+    const b1 = bytes[i++];
+    const b2 = i < bytes.length ? bytes[i++] : NaN;
+    const b3 = i < bytes.length ? bytes[i++] : NaN;
+    encoded += chars[b1 >> 2];
+    encoded += chars[((b1 & 3) << 4) | (isNaN(b2) ? 0 : b2 >> 4)];
+    encoded += isNaN(b2) ? "=" : chars[((b2 & 15) << 2) | (isNaN(b3) ? 0 : b3 >> 6)];
+    encoded += isNaN(b3) ? "=" : chars[b3 & 63];
+  }
+  return encoded;
+}
+
 function getDockerMountPath(raw) {
   const p = sanitizePath(raw);
   const wslMatch = p.match(/^(?:\\\\wsl\.localhost|\\\\wsl\$)\\([^\\]+)\\(.*)$/i);
@@ -1100,26 +1123,49 @@ export default class AgentSpawner extends View {
       // Wrapper script when setupScript is present, or binaryMode === "install", or dropping privileges
       if (setupScript || this.binaryMode === "install" || (needsRootSetup && !this.dockerRunAsRoot)) {
         const prog = agent.run[0] || "agy";
-        let wrapper = "set -e; ";
+        let script = "set -e\n";
         if (setupScript) {
-          wrapper += `echo "==> Running pre-installation script..."; ${setupScript}; `;
+          script += `echo "==> Running pre-installation script..."\n${setupScript}\n`;
         }
         if (this.binaryMode === "install") {
-          wrapper += `if ! command -v ${prog} >/dev/null 2>&1; then echo "==> Auto-installing ${prog}..."; if [ "${prog}" = "agy" ]; then (curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- -d /usr/local/bin) || (curl -fsSL https://antigravity.google/cli/install.sh | bash); else curl -fsSL https://antigravity.google/cli/install.sh | bash; fi; fi; `;
+          script += `if ! command -v ${prog} >/dev/null 2>&1; then\n  echo "==> Auto-installing ${prog}..."\n  if [ "${prog}" = "agy" ]; then\n    (curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- -d /usr/local/bin) || (curl -fsSL https://antigravity.google/cli/install.sh | bash)\n  else\n    curl -fsSL https://antigravity.google/cli/install.sh | bash\n  fi\nfi\n`;
         }
-        wrapper += 'export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"; ';
+        script += 'export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"\n';
         if (!this.dockerRunAsRoot) {
-          // Drop privileges to host UID
-          wrapper += `u=$(id -nu ${this.uid} 2>/dev/null) || { useradd -u ${this.uid} -m devuser 2>/dev/null && u=devuser; }; export HOME="$(getent passwd "$u" 2>/dev/null | cut -d: -f6 || echo /tmp)"; export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"; if command -v runuser >/dev/null 2>&1; then exec runuser -u "$u" -- "$@"; else exec su -p -s /bin/sh "$u" -- -c 'exec "$@"' sh "$@"; fi`;
+          script += `u=$(id -nu ${this.uid} 2>/dev/null) || { useradd -u ${this.uid} -m devuser 2>/dev/null && u=devuser; }\nexport HOME="$(getent passwd "$u" 2>/dev/null | cut -d: -f6 || echo /tmp)"\nexport PATH="/usr/local/bin:$HOME/.local/bin:$PATH"\nif command -v runuser >/dev/null 2>&1; then\n  exec runuser -u "$u" -- "$@"\nelse\n  exec su -p -s /bin/sh "$u" -- -c 'exec "$@"' sh "$@"\nfi\n`;
         } else {
-          wrapper += 'exec "$@"';
+          script += 'exec "$@"\n';
         }
-        dockerCmd.push("sh", "-c", wrapper, "sh", ...finalArgv);
+        const b64 = toBase64(script);
+        dockerCmd.push("sh", "-c", `echo ${b64} | base64 -d | sh -s -- "$@"`, "sh", ...finalArgv);
       } else {
         dockerCmd.push(...finalArgv);
       }
 
       finalArgv = dockerCmd;
+    }
+
+    // If on Windows and targeting a WSL directory, route execution through wsl.exe
+    const cleanPath = sanitizePath(this.cwd);
+    const wslMatch = cleanPath.match(/^(?:\\\\wsl\.localhost|\\\\wsl\$)\\([^\\]+)\\(.*)$/i) ||
+                     cleanPath.match(/^(?:\/\/wsl\.localhost|\/\/wsl\$)\/([^\/]+)\/(.*)$/i);
+
+    if (wslMatch) {
+      const distro = wslMatch[1];
+      const linuxPath = "/" + wslMatch[2].replace(/\\/g, "/");
+      if (this.useDocker) {
+        // Translate Windows UNC mount path to native Linux path for Docker inside WSL
+        finalArgv = finalArgv.map((arg) => {
+          if (typeof arg === "string" && arg.includes(":/workspace")) {
+            return `${linuxPath}:/workspace`;
+          }
+          return arg;
+        });
+        finalArgv = ["wsl.exe", "-d", distro, "--", ...finalArgv];
+      } else {
+        // Direct execution on host inside the WSL distro at project directory
+        finalArgv = ["wsl.exe", "-d", distro, "--cd", linuxPath, "--", ...finalArgv];
+      }
     }
 
     // Save history & preferences
@@ -1152,6 +1198,10 @@ export default class AgentSpawner extends View {
     const title = this.useDocker ? `🐳 [${shortImg}] ${agent.name}` : agent.name;
 
     const cleanCwd = sanitizePath(this.cwd);
+    const wslFolderMatch = cleanCwd.match(/^(?:\\\\wsl\.localhost|\\\\wsl\$)\\([^\\]+)\\(.*)$/i) ||
+                           cleanCwd.match(/^(?:\/\/wsl\.localhost|\/\/wsl\$)\/([^\/]+)\/(.*)$/i);
+    // When executing via wsl.exe, omit Windows UNC folder so PowerShell doesn't throw a provider error
+    const spawnFolder = wslFolderMatch ? "" : cleanCwd;
     const dirName = getDisplayDirectoryName(this.cwd);
 
     // Execute spawn based on target and machine
@@ -1159,7 +1209,7 @@ export default class AgentSpawner extends View {
       run("space.new", {
         name: `${title} (${dirName})`,
         machine: targetMachine || "",
-        folder: cleanCwd,
+        folder: spawnFolder,
         argv: finalArgv,
       });
     } else if (this.target === "tab") {
@@ -1167,7 +1217,7 @@ export default class AgentSpawner extends View {
         run("tab.new", {
           name: title,
           space: activeSpace.id,
-          folder: cleanCwd,
+          folder: spawnFolder,
           argv: finalArgv,
         });
       } else {
@@ -1176,14 +1226,14 @@ export default class AgentSpawner extends View {
           run("tab.new", {
             name: title,
             space: spaceOnTarget.id,
-            folder: cleanCwd,
+            folder: spawnFolder,
             argv: finalArgv,
           });
         } else {
           run("space.new", {
             name: title,
             machine: targetMachine || "",
-            folder: cleanCwd,
+            folder: spawnFolder,
             argv: finalArgv,
           });
         }
@@ -1201,14 +1251,14 @@ export default class AgentSpawner extends View {
           run("tab.new", {
             name: title,
             space: spaceOnTarget.id,
-            folder: this.cwd,
+            folder: spawnFolder,
             argv: finalArgv,
           });
         } else {
           run("space.new", {
             name: title,
             machine: targetMachine || "",
-            folder: this.cwd,
+            folder: spawnFolder,
             argv: finalArgv,
           });
         }
