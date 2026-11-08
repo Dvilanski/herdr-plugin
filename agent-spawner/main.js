@@ -97,15 +97,31 @@ function sanitizePath(raw) {
   return p;
 }
 
-function quoteForShell(arg) {
-  if (typeof arg !== "string") return String(arg);
-  if ((arg.startsWith("'") && arg.endsWith("'")) || (arg.startsWith('"') && arg.endsWith('"'))) {
-    return arg;
+function toBase64(str) {
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(str, "utf8").toString("base64");
   }
-  if (/[\s;|<>&"'$]/.test(arg)) {
-    return "'" + arg.replace(/'/g, "'\\''") + "'";
+  if (typeof btoa === "function") {
+    return btoa(unescape(encodeURIComponent(str)));
   }
-  return arg;
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let encoded = "";
+  let i = 0;
+  const bytes = new TextEncoder().encode(str);
+  while (i < bytes.length) {
+    const b1 = bytes[i++];
+    const b2 = i < bytes.length ? bytes[i++] : NaN;
+    const b3 = i < bytes.length ? bytes[i++] : NaN;
+    encoded += chars[b1 >> 2];
+    encoded += chars[((b1 & 3) << 4) | (isNaN(b2) ? 0 : b2 >> 4)];
+    encoded += isNaN(b2) ? "=" : chars[((b2 & 15) << 2) | (isNaN(b3) ? 0 : b3 >> 6)];
+    encoded += isNaN(b3) ? "=" : chars[b3 & 63];
+  }
+  return encoded;
+}
+
+function shellEscapeSingle(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
 }
 
 function getDockerMountPath(raw) {
@@ -186,6 +202,16 @@ export default class AgentSpawner extends View {
     this.selectedAgentKey = shared(LAST_AGENT_KEY) ?? "antigravity";
     this.useCustomCommand = false;
     this.customCommand = "";
+    this.customName = "";
+
+    this.customNameInput = InputState.new({
+      value: "",
+      placeholder: "Optional custom name (leave empty for default)...",
+    });
+    this.customNameInput.on("change", (_e, cx) => {
+      this.customName = this.customNameInput.value();
+      cx.notify();
+    });
 
     // Docker container isolation settings
     this.useDocker = shared(USE_DOCKER_KEY) ?? false;
@@ -360,7 +386,10 @@ export default class AgentSpawner extends View {
     // Discover local docker images
     cx.spawn(async (cx) => {
       try {
-        const res = await exec("docker", ["images", "--format", "{{.Repository}}:{{.Tag}}"]);
+        let res = await exec("docker", ["images", "--format", "{{.Repository}}:{{.Tag}}"]).catch(() => null);
+        if (!res || res.code !== 0) {
+          res = await exec("wsl.exe", ["-e", "docker", "images", "--format", "{{.Repository}}:{{.Tag}}"]).catch(() => null);
+        }
         const lines = (res?.stdout ?? "")
           .split("\n")
           .map((s) => s.trim())
@@ -383,19 +412,42 @@ export default class AgentSpawner extends View {
 
     cx.spawn(async (cx) => {
       try {
-        const h = home();
-        const dockerDir = "/home/ben/Documents/projects/herdr-plugins/agent-spawner/docker";
-        await exec("cp", [`${h}/.local/bin/agy`, `${dockerDir}/agy`]);
-        const res = await exec("docker", ["build", "-t", "herdr-agent:latest", dockerDir]);
-        if (res.code === 0) {
+        const extraSetup = this.dockerSetupScript.trim();
+        const dockerfileLines = [
+          "FROM ubuntu:24.04",
+          "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git curl python3 python3-pip && curl -fsSL https://antigravity.google/cli/install.sh -o /tmp/install-agy.sh && bash /tmp/install-agy.sh -d /usr/local/bin && rm -f /tmp/install-agy.sh && chmod 755 /usr/local/bin/agy && rm -rf /var/lib/apt/lists/*",
+        ];
+        if (extraSetup) {
+          dockerfileLines.push(`RUN ${extraSetup}`);
+        }
+        dockerfileLines.push("WORKDIR /workspace");
+        const dockerfileB64 = toBase64(dockerfileLines.join("\n") + "\n");
+        const buildScript = `mkdir -p /tmp/herdr-agent-build && echo ${dockerfileB64} > /tmp/herdr-agent-build/df.b64 && base64 -d /tmp/herdr-agent-build/df.b64 > /tmp/herdr-agent-build/Dockerfile && docker build -t herdr-agent:latest /tmp/herdr-agent-build`;
+
+        const cleanPath = sanitizePath(this.cwd);
+        const wslMatch = cleanPath.match(/^(?:\\\\wsl\.localhost|\\\\wsl\$)\\([^\\]+)\\(.*)$/i) ||
+                         cleanPath.match(/^(?:\/\/wsl\.localhost|\/\/wsl\$)\/([^\/]+)\/(.*)$/i);
+
+        let res = null;
+        if (wslMatch) {
+          const distro = wslMatch[1];
+          res = await exec("wsl.exe", ["-d", distro, "-e", "sh", "-c", buildScript]).catch(() => null);
+        } else {
+          res = await exec("sh", ["-c", buildScript]).catch(() => null);
+          if (!res || res.code !== 0) {
+            res = await exec("wsl.exe", ["-e", "sh", "-c", buildScript]).catch(() => null);
+          }
+        }
+
+        if (res && res.code === 0) {
           this.setDockerImage("herdr-agent:latest");
           this.binaryMode = "image";
           if (!this.localDockerImages.includes("herdr-agent:latest")) {
             this.localDockerImages = ["herdr-agent:latest", ...this.localDockerImages];
           }
-          notify({ title: "Image Ready", body: "herdr-agent:latest built successfully!" });
+          notify({ title: "Image Ready", body: "herdr-agent:latest built successfully with curl, git, python3, and agy!" });
         } else {
-          notify({ title: "Build Failed", body: res.stderr || "Could not build docker image", level: "error" });
+          notify({ title: "Build Failed", body: res?.stderr || "Could not build docker image", level: "error" });
         }
       } catch (err) {
         notify({ title: "Build Error", body: String(err), level: "error" });
@@ -1039,7 +1091,8 @@ export default class AgentSpawner extends View {
       const selectedImage = this.dockerImage.trim() || "herdr-agent:latest";
       const userSpec = `${this.uid}:${this.gid}`;
       const dirName = getDisplayDirectoryName(this.cwd);
-      const spaceName = activeSpace?.name || dirName || "workspace";
+      const customSpaceName = this.customName.trim();
+      const spaceName = customSpaceName || activeSpace?.name || dirName || "workspace";
       const cleanSpace = spaceName.toLowerCase().replace(/[^a-z0-9_.-]/g, "-").replace(/^-+|-+$/g, "") || "space";
       const cleanAgent = (agent.key || agent.name || "agent").toLowerCase().replace(/[^a-z0-9_.-]/g, "-");
       const shortSuffix = Math.random().toString(36).slice(2, 6);
@@ -1106,12 +1159,11 @@ export default class AgentSpawner extends View {
         dockerCmd.push(...this.dockerExtraFlags.trim().split(/\s+/));
       }
 
-      dockerCmd.push(selectedImage);
-
       // Wrapper script when setupScript is present, or binaryMode === "install", or dropping privileges
       if (setupScript || this.binaryMode === "install" || (needsRootSetup && !this.dockerRunAsRoot)) {
         const prog = agent.run[0] || "agy";
-        let script = "set -e\n";
+        const agentCmdLine = finalArgv.map(shellEscapeSingle).join(" ");
+        let script = "set -e\nrm -f /tmp/herdr.b64 /tmp/herdr-boot.sh\n";
         if (setupScript) {
           script += `echo "==> Running pre-installation script..."\n${setupScript}\n`;
         }
@@ -1120,13 +1172,21 @@ export default class AgentSpawner extends View {
         }
         script += 'export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"\n';
         if (!this.dockerRunAsRoot) {
-          script += `u=$(id -nu ${this.uid} 2>/dev/null) || { useradd -u ${this.uid} -m devuser 2>/dev/null && u=devuser; }\nexport HOME="/home/$u"\nexport PATH="/usr/local/bin:$HOME/.local/bin:$PATH"\nif command -v runuser >/dev/null 2>&1; then\n  exec runuser -u "$u" -- "$@"\nelse\n  exec su -p -s /bin/sh "$u" -- -c 'exec "$@"' sh "$@"\nfi\n`;
+          script += `u=$(id -nu ${this.uid} 2>/dev/null) || { useradd -u ${this.uid} -m devuser 2>/dev/null && u=devuser; }\nmkdir -p "/home/$u" 2>/dev/null || true\nchown "$u" "/home/$u" 2>/dev/null || true\nexport HOME="/home/$u"\nexport PATH="/usr/local/bin:$HOME/.local/bin:$PATH"\nif command -v runuser >/dev/null 2>&1; then\n  exec runuser -u "$u" -- ${agentCmdLine}\nelse\n  exec su -p -s /bin/sh "$u" -c ${shellEscapeSingle("exec " + agentCmdLine)}\nfi\n`;
         } else {
-          script += 'exec "$@"\n';
+          script += `exec ${agentCmdLine}\n`;
         }
-        dockerCmd.push("sh", "-c", script, "sh", ...finalArgv);
+        const b64 = toBase64(script);
+        dockerCmd.push(
+          "-e",
+          `HERDR_BOOT=${b64}`,
+          selectedImage,
+          "sh",
+          "-c",
+          "echo $HERDR_BOOT > /tmp/herdr.b64 && base64 -d /tmp/herdr.b64 > /tmp/herdr-boot.sh && exec sh /tmp/herdr-boot.sh"
+        );
       } else {
-        dockerCmd.push(...finalArgv);
+        dockerCmd.push(selectedImage, ...finalArgv);
       }
 
       finalArgv = dockerCmd;
@@ -1155,9 +1215,6 @@ export default class AgentSpawner extends View {
       }
     }
 
-    // Safely quote arguments to protect against shell word-splitting and delimiter parsing
-    finalArgv = finalArgv.map(quoteForShell);
-
     // Save history & preferences
     if (task) {
       const nextHistory = [task, ...this.history.filter((h) => h !== task)].slice(0, 5);
@@ -1185,7 +1242,9 @@ export default class AgentSpawner extends View {
     }
 
     const shortImg = (this.dockerImage.trim() || "docker").split("/").pop() || "docker";
-    const title = this.useDocker ? `🐳 [${shortImg}] ${agent.name}` : agent.name;
+    const defaultTitle = this.useDocker ? `🐳 [${shortImg}] ${agent.name}` : agent.name;
+    const customName = this.customName.trim();
+    const title = customName || defaultTitle;
 
     const cleanCwd = sanitizePath(this.cwd);
     const wslFolderMatch = cleanCwd.match(/^(?:\\\\wsl\.localhost|\\\\wsl\$)\\([^\\]+)\\(.*)$/i) ||
@@ -1193,11 +1252,12 @@ export default class AgentSpawner extends View {
     // When executing via wsl.exe, omit Windows UNC folder so PowerShell doesn't throw a provider error
     const spawnFolder = wslFolderMatch ? "" : cleanCwd;
     const dirName = getDisplayDirectoryName(this.cwd);
+    const spaceTitle = customName || `${defaultTitle} (${dirName})`;
 
     // Execute spawn based on target and machine
     if (this.target === "space") {
       run("space.new", {
-        name: `${title} (${dirName})`,
+        name: spaceTitle,
         machine: targetMachine || "",
         folder: spawnFolder,
         argv: finalArgv,
@@ -1549,6 +1609,36 @@ export default class AgentSpawner extends View {
                   .child(this.renderTargetButton("split-right", "Split Right", "◧"))
                   .child(this.renderTargetButton("split-down", "Split Down", "⬓"))
                   .child(this.renderTargetButton("space", "New Space", "❐"))
+              )
+              .when(this.target === "space" || this.target === "tab", (el) =>
+                el.child(
+                  h_flex()
+                    .gap(8)
+                    .items_center()
+                    .mt(2)
+                    .child(
+                      div()
+                        .text_size(11.5)
+                        .font_medium()
+                        .text_color(t.muted)
+                        .child(this.target === "space" ? "Space Name:" : "Tab Name:")
+                    )
+                    .child(
+                      div()
+                        .flex_1()
+                        .child(
+                          Input.new(this.customNameInput)
+                            .h(30)
+                            .px(8)
+                            .rounded(6)
+                            .border_1()
+                            .border_color(t.input)
+                            .bg(t.background)
+                            .text_size(12)
+                            .text_color(t.foreground)
+                        )
+                    )
+                )
               )
           )
 
