@@ -43,6 +43,31 @@ Inspect, manage, and interact with all your Docker containers, images, and AI ag
 
 ## Installation
 
+### Mode A: Dockable Sidebar (Recommended)
+
+1. Clone or copy `docker-dashboard` and `layouts/main-custom.json`:
+   ```bash
+   cp -r /path/to/herdr-plugins/docker-dashboard ~/.config/herdr-app/mods/
+   mkdir -p ~/.config/herdr-app/layouts
+   cp /path/to/herdr-plugins/layouts/main-custom.json ~/.config/herdr-app/layouts/
+   ```
+
+2. Switch Herdr to the custom layout:
+   ```bash
+   herdr-app do layout.switch --name main-custom
+   ```
+
+3. Bind <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> in `~/.config/herdr-app/keys.json` under `"global"`:
+   ```json
+   "global": {
+     "ctrl-shift-d": "layout.toggle:docker-sidebar"
+   }
+   ```
+
+---
+
+### Mode B: Floating Dialog Modal
+
 1. Clone or symlink `docker-dashboard` into your Herdr mods directory:
    ```bash
    ln -s /path/to/herdr-plugins/docker-dashboard ~/.config/herdr-app/mods/docker-dashboard
