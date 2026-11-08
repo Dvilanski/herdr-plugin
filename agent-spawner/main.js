@@ -90,6 +90,32 @@ function prepareAgentArgv(agent, task) {
   return [...baseRun, task];
 }
 
+function sanitizePath(raw) {
+  if (!raw || typeof raw !== "string") return "";
+  let p = raw.trim();
+  p = p.replace(/^Microsoft\.PowerShell\.Core\\FileSystem::/i, "");
+  return p;
+}
+
+function getDockerMountPath(raw) {
+  const p = sanitizePath(raw);
+  const wslMatch = p.match(/^(?:\\\\wsl\.localhost|\\\\wsl\$)\\([^\\]+)\\(.*)$/i);
+  if (wslMatch) {
+    const distro = wslMatch[1];
+    const subPath = wslMatch[2].replace(/\\/g, "/");
+    return `//wsl.localhost/${distro}/${subPath}`;
+  }
+  if (/^[a-zA-Z]:\\/.test(p)) {
+    return p.replace(/\\/g, "/");
+  }
+  return p;
+}
+
+function getDisplayDirectoryName(raw) {
+  const p = sanitizePath(raw).replace(/\\/g, "/").replace(/\/+$/, "");
+  return p.split("/").pop() || "workspace";
+}
+
 export default class AgentSpawner extends View {
   init(_props, cx) {
     this.handle = cx.focus_handle();
@@ -113,9 +139,9 @@ export default class AgentSpawner extends View {
     // Working directory default: space folder or home on that machine
     if (this.selectedMachine) {
       const remSpace = spaces().find((s) => s.machine === this.selectedMachine);
-      this.cwd = remSpace?.folder || "~";
+      this.cwd = sanitizePath(remSpace?.folder || "~");
     } else {
-      this.cwd = focused()?.cwd ?? activePane?.cwd ?? activeSpace?.folder ?? home();
+      this.cwd = sanitizePath(focused()?.cwd ?? activePane?.cwd ?? activeSpace?.folder ?? home());
     }
 
     this.cwdInput = InputState.new({
@@ -123,7 +149,7 @@ export default class AgentSpawner extends View {
       placeholder: "e.g. /home/user/project or ~",
     });
     this.cwdInput.on("change", (_e, cx) => {
-      this.cwd = this.cwdInput.value();
+      this.cwd = sanitizePath(this.cwdInput.value());
       cx.notify();
     });
 
@@ -387,8 +413,8 @@ export default class AgentSpawner extends View {
   async browseFolder(cx) {
     const picked = await pickFolder({ prompt: "Select Project Directory" });
     if (picked) {
-      this.cwd = picked;
-      this.cwdInput.set_value(picked);
+      this.cwd = sanitizePath(picked);
+      this.cwdInput.set_value(this.cwd);
       cx.notify();
     }
   }
@@ -569,8 +595,8 @@ export default class AgentSpawner extends View {
 
   selectDirectory(path, cx) {
     if (!path) return;
-    this.cwd = path;
-    this.cwdInput.set_value(path);
+    this.cwd = sanitizePath(path);
+    this.cwdInput.set_value(this.cwd);
     cx.notify();
   }
 
@@ -1001,20 +1027,22 @@ export default class AgentSpawner extends View {
     if (this.useDocker) {
       const selectedImage = this.dockerImage.trim() || "herdr-agent:latest";
       const userSpec = `${this.uid}:${this.gid}`;
-      const spaceName = activeSpace?.name || this.cwd.split("/").pop() || "workspace";
+      const dirName = getDisplayDirectoryName(this.cwd);
+      const spaceName = activeSpace?.name || dirName || "workspace";
       const cleanSpace = spaceName.toLowerCase().replace(/[^a-z0-9_.-]/g, "-").replace(/^-+|-+$/g, "") || "space";
       const cleanAgent = (agent.key || agent.name || "agent").toLowerCase().replace(/[^a-z0-9_.-]/g, "-");
       const shortSuffix = Math.random().toString(36).slice(2, 6);
       const containerName = `herdr-agent-${cleanSpace}-${cleanAgent}-${shortSuffix}`;
       const setupScript = this.dockerSetupScript.trim();
       const needsRootSetup = setupScript.length > 0 || this.dockerRunAsRoot;
+      const mountPath = getDockerMountPath(this.cwd);
 
       const dockerCmd = [
         "docker", "run", "-it", "--rm",
         "--name", containerName,
         "--label", "herdr.agent=true",
         "--label", `herdr.space=${cleanSpace}`,
-        "-v", `${this.cwd}:/workspace`,
+        "-v", `${mountPath}:/workspace`,
         "-w", "/workspace",
       ];
 
@@ -1123,13 +1151,15 @@ export default class AgentSpawner extends View {
     const shortImg = (this.dockerImage.trim() || "docker").split("/").pop() || "docker";
     const title = this.useDocker ? `🐳 [${shortImg}] ${agent.name}` : agent.name;
 
+    const cleanCwd = sanitizePath(this.cwd);
+    const dirName = getDisplayDirectoryName(this.cwd);
+
     // Execute spawn based on target and machine
     if (this.target === "space") {
-      const dirName = this.cwd.split("/").pop() || "agent";
       run("space.new", {
         name: `${title} (${dirName})`,
         machine: targetMachine || "",
-        folder: this.cwd,
+        folder: cleanCwd,
         argv: finalArgv,
       });
     } else if (this.target === "tab") {
@@ -1137,7 +1167,7 @@ export default class AgentSpawner extends View {
         run("tab.new", {
           name: title,
           space: activeSpace.id,
-          folder: this.cwd,
+          folder: cleanCwd,
           argv: finalArgv,
         });
       } else {
@@ -1146,14 +1176,14 @@ export default class AgentSpawner extends View {
           run("tab.new", {
             name: title,
             space: spaceOnTarget.id,
-            folder: this.cwd,
+            folder: cleanCwd,
             argv: finalArgv,
           });
         } else {
           run("space.new", {
             name: title,
             machine: targetMachine || "",
-            folder: this.cwd,
+            folder: cleanCwd,
             argv: finalArgv,
           });
         }
