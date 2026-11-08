@@ -124,6 +124,17 @@ function shellEscapeSingle(s) {
   return "'" + String(s).replace(/'/g, "'\\''") + "'";
 }
 
+function quoteForShell(arg) {
+  if (typeof arg !== "string") return String(arg);
+  if ((arg.startsWith("'") && arg.endsWith("'")) || (arg.startsWith('"') && arg.endsWith('"'))) {
+    return arg;
+  }
+  if (/[\s;|<>&"'${}]/.test(arg)) {
+    return "'" + arg.replace(/'/g, "'\\''") + "'";
+  }
+  return arg;
+}
+
 function getDockerMountPath(raw) {
   const p = sanitizePath(raw);
   const wslMatch = p.match(/^(?:\\\\wsl\.localhost|\\\\wsl\$)\\([^\\]+)\\(.*)$/i);
@@ -422,7 +433,7 @@ export default class AgentSpawner extends View {
         }
         dockerfileLines.push("WORKDIR /workspace");
         const dockerfileB64 = toBase64(dockerfileLines.join("\n") + "\n");
-        const buildScript = `mkdir -p /tmp/herdr-agent-build && echo ${dockerfileB64} > /tmp/herdr-agent-build/df.b64 && base64 -d /tmp/herdr-agent-build/df.b64 > /tmp/herdr-agent-build/Dockerfile && docker build -t herdr-agent:latest /tmp/herdr-agent-build`;
+        const buildScript = `mkdir\${IFS}-p\${IFS}/tmp/herdr-agent-build&&echo\${IFS}${dockerfileB64}>/tmp/herdr-agent-build/df.b64&&base64\${IFS}-d\${IFS}/tmp/herdr-agent-build/df.b64>/tmp/herdr-agent-build/Dockerfile&&docker\${IFS}build\${IFS}-t\${IFS}herdr-agent:latest\${IFS}/tmp/herdr-agent-build`;
 
         const cleanPath = sanitizePath(this.cwd);
         const wslMatch = cleanPath.match(/^(?:\\\\wsl\.localhost|\\\\wsl\$)\\([^\\]+)\\(.*)$/i) ||
@@ -1131,24 +1142,9 @@ export default class AgentSpawner extends View {
         dockerCmd.push("-v", "/etc/ssl/certs:/etc/ssl/certs:ro");
       }
 
-      // Git integration
-      if (this.gitName.trim()) {
-        dockerCmd.push("-e", `GIT_AUTHOR_NAME=${this.gitName.trim()}`);
-        dockerCmd.push("-e", `GIT_COMMITTER_NAME=${this.gitName.trim()}`);
-      }
-      if (this.gitEmail.trim()) {
-        dockerCmd.push("-e", `GIT_AUTHOR_EMAIL=${this.gitEmail.trim()}`);
-        dockerCmd.push("-e", `GIT_COMMITTER_EMAIL=${this.gitEmail.trim()}`);
-      }
-
-      // API Key / Auth integration (isolated environment variables)
+      // Forward API Key from host environment if not explicitly specified
       const keyVal = this.apiKey.trim();
-      if (keyVal) {
-        dockerCmd.push("-e", `GEMINI_API_KEY=${keyVal}`);
-        dockerCmd.push("-e", `ANTHROPIC_API_KEY=${keyVal}`);
-        dockerCmd.push("-e", `OPENAI_API_KEY=${keyVal}`);
-      } else {
-        // Forward from host environment only if present
+      if (!keyVal) {
         for (const envVar of ["GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"]) {
           dockerCmd.push("-e", envVar);
         }
@@ -1159,35 +1155,44 @@ export default class AgentSpawner extends View {
         dockerCmd.push(...this.dockerExtraFlags.trim().split(/\s+/));
       }
 
-      // Wrapper script when setupScript is present, or binaryMode === "install", or dropping privileges
-      if (setupScript || this.binaryMode === "install" || (needsRootSetup && !this.dockerRunAsRoot)) {
-        const prog = agent.run[0] || "agy";
-        const agentCmdLine = finalArgv.map(shellEscapeSingle).join(" ");
-        let script = "set -e\nrm -f /tmp/herdr.b64 /tmp/herdr-boot.sh\n";
-        if (setupScript) {
-          script += `echo "==> Running pre-installation script..."\n${setupScript}\n`;
-        }
-        if (this.binaryMode === "install") {
-          script += `if ! command -v ${prog} >/dev/null 2>&1; then\n  echo "==> Auto-installing ${prog}..."\n  if [ "${prog}" = "agy" ]; then\n    curl -fsSL https://antigravity.google/cli/install.sh -o /tmp/install-agy.sh && bash /tmp/install-agy.sh -d /usr/local/bin && rm -f /tmp/install-agy.sh\n  else\n    curl -fsSL https://antigravity.google/cli/install.sh | bash\n  fi\nfi\n`;
-        }
-        script += 'export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"\n';
-        if (!this.dockerRunAsRoot) {
-          script += `u=$(id -nu ${this.uid} 2>/dev/null) || { useradd -u ${this.uid} -m devuser 2>/dev/null && u=devuser; }\nmkdir -p "/home/$u" 2>/dev/null || true\nchown "$u" "/home/$u" 2>/dev/null || true\nexport HOME="/home/$u"\nexport PATH="/usr/local/bin:$HOME/.local/bin:$PATH"\nif command -v runuser >/dev/null 2>&1; then\n  exec runuser -u "$u" -- ${agentCmdLine}\nelse\n  exec su -p -s /bin/sh "$u" -c ${shellEscapeSingle("exec " + agentCmdLine)}\nfi\n`;
-        } else {
-          script += `exec ${agentCmdLine}\n`;
-        }
-        const b64 = toBase64(script);
-        dockerCmd.push(
-          "-e",
-          `HERDR_BOOT=${b64}`,
-          selectedImage,
-          "sh",
-          "-c",
-          "echo $HERDR_BOOT > /tmp/herdr.b64 && base64 -d /tmp/herdr.b64 > /tmp/herdr-boot.sh && exec sh /tmp/herdr-boot.sh"
-        );
-      } else {
-        dockerCmd.push(selectedImage, ...finalArgv);
+      // Build self-contained base64 bootstrap script so no spaces or quotes appear in argv
+      const prog = agent.run[0] || "agy";
+      const agentCmdLine = finalArgv.map(shellEscapeSingle).join(" ");
+      let script = "set -e\nrm -f /tmp/b64 /tmp/boot.sh\n";
+      if (this.gitName.trim()) {
+        script += `export GIT_AUTHOR_NAME=${shellEscapeSingle(this.gitName.trim())}\n`;
+        script += `export GIT_COMMITTER_NAME=${shellEscapeSingle(this.gitName.trim())}\n`;
       }
+      if (this.gitEmail.trim()) {
+        script += `export GIT_AUTHOR_EMAIL=${shellEscapeSingle(this.gitEmail.trim())}\n`;
+        script += `export GIT_COMMITTER_EMAIL=${shellEscapeSingle(this.gitEmail.trim())}\n`;
+      }
+      if (keyVal) {
+        script += `export GEMINI_API_KEY=${shellEscapeSingle(keyVal)}\n`;
+        script += `export ANTHROPIC_API_KEY=${shellEscapeSingle(keyVal)}\n`;
+        script += `export OPENAI_API_KEY=${shellEscapeSingle(keyVal)}\n`;
+      }
+      if (setupScript) {
+        script += `echo "==> Running pre-installation script..."\n${setupScript}\n`;
+      }
+      if (this.binaryMode === "install") {
+        script += `if ! command -v ${prog} >/dev/null 2>&1; then\n  echo "==> Auto-installing ${prog}..."\n  if [ "${prog}" = "agy" ]; then\n    curl -fsSL https://antigravity.google/cli/install.sh -o /tmp/install-agy.sh && bash /tmp/install-agy.sh -d /usr/local/bin && rm -f /tmp/install-agy.sh\n  else\n    curl -fsSL https://antigravity.google/cli/install.sh | bash\n  fi\nfi\n`;
+      }
+      script += 'export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"\n';
+      if (needsRootSetup && !this.dockerRunAsRoot) {
+        script += `u=$(id -nu ${this.uid} 2>/dev/null) || { useradd -u ${this.uid} -m devuser 2>/dev/null && u=devuser; }\nmkdir -p "/home/$u" 2>/dev/null || true\nchown "$u" "/home/$u" 2>/dev/null || true\nexport HOME="/home/$u"\nexport PATH="/usr/local/bin:$HOME/.local/bin:$PATH"\nif command -v runuser >/dev/null 2>&1; then\n  exec runuser -u "$u" -- ${agentCmdLine}\nelse\n  exec su -p -s /bin/sh "$u" -c ${shellEscapeSingle("exec " + agentCmdLine)}\nfi\n`;
+      } else {
+        script += `exec ${agentCmdLine}\n`;
+      }
+      const b64 = toBase64(script);
+      dockerCmd.push(
+        "-e",
+        `HERDR_BOOT=${b64}`,
+        selectedImage,
+        "sh",
+        "-c",
+        "echo${IFS}${HERDR_BOOT}>/tmp/b64&&base64${IFS}-d${IFS}/tmp/b64>/tmp/boot.sh&&exec${IFS}/bin/sh${IFS}/tmp/boot.sh"
+      );
 
       finalArgv = dockerCmd;
     }
@@ -1214,6 +1219,9 @@ export default class AgentSpawner extends View {
         finalArgv = ["wsl.exe", "-d", distro, "--cd", linuxPath, "-e", ...finalArgv];
       }
     }
+
+    // Safely quote arguments for host interactive shell (PowerShell / bash)
+    finalArgv = finalArgv.map(quoteForShell);
 
     // Save history & preferences
     if (task) {
