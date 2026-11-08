@@ -30,6 +30,12 @@ Easily launch and orchestrate AI coding agents (Antigravity, Claude Code, Codex,
   - **Complete Host Separation**: No mounting of host home directories (`~/.gemini`, `~/.anthropic`) by default.
   - **Git Identity Integration**: Directly configure Git Author Name & Email in the spawner window, injected via environment variables (`GIT_AUTHOR_NAME`, `GIT_COMMITTER_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_EMAIL`).
   - **Host SSL Certificates**: Optional 1-click toggle to mount host root certificates (`/etc/ssl/certs:ro`) to eliminate SSL/TLS handshake errors on minimal images.
+  - **Pre-install Setup Script**:
+    - Custom command line input (e.g. `apt-get update && apt-get install -y curl ca-certificates git`) that runs as root inside the container *before* the agent starts.
+    - Resolves missing tools on minimal images like `ubuntu:latest` where `curl` or `git` are not installed.
+    - Quick-fill preset chips: `📦 apt curl & git`, `🐍 python3 & pip`, `🟢 nodejs`, and `✕ Clear`.
+    - Seamlessly auto-installs the agent (e.g. `agy`) right after `curl` is installed.
+    - Option to drop privileges to the host UID after pre-install or run the agent as root.
   - **3 Agent Binary Strategies**:
     - `Pre-installed in Image`: Uses `herdr-agent:latest` or custom image with binaries pre-baked.
     - `Mount from Host`: Mounts `~/.local/bin/agy` read-only into `/usr/local/bin/agy:ro`.

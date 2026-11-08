@@ -28,8 +28,16 @@ const USE_DOCKER_KEY = "agent-spawner.use-docker";
 const DOCKER_IMAGE_KEY = "agent-spawner.docker-image";
 const DOCKER_CERTS_KEY = "agent-spawner.docker-certs";
 const DOCKER_BIN_MODE_KEY = "agent-spawner.docker-bin-mode";
+const DOCKER_SETUP_SCRIPT_KEY = "agent-spawner.docker-setup-script";
+const DOCKER_RUN_AS_ROOT_KEY = "agent-spawner.docker-run-as-root";
 const GIT_NAME_KEY = "agent-spawner.git-name";
 const GIT_EMAIL_KEY = "agent-spawner.git-email";
+
+const DOCKER_SETUP_PRESETS = [
+  { label: "📦 apt curl & git", script: "apt-get update && apt-get install -y curl ca-certificates git" },
+  { label: "🐍 python3 & pip", script: "apt-get update && apt-get install -y python3 python3-pip curl ca-certificates git" },
+  { label: "🟢 nodejs", script: "apt-get update && apt-get install -y curl ca-certificates git && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs" },
+];
 
 const DEFAULT_AGENTS = [
   { key: "antigravity", name: "Antigravity", icon: "icons/antigravity.svg", run: ["agy"], installed: true },
@@ -147,6 +155,8 @@ export default class AgentSpawner extends View {
     this.dockerImage = shared(DOCKER_IMAGE_KEY) ?? "herdr-agent:latest";
     this.dockerMountCerts = shared(DOCKER_CERTS_KEY) ?? true;
     this.binaryMode = shared(DOCKER_BIN_MODE_KEY) ?? "image"; // "image" | "mount" | "install"
+    this.dockerSetupScript = shared(DOCKER_SETUP_SCRIPT_KEY) ?? "";
+    this.dockerRunAsRoot = shared(DOCKER_RUN_AS_ROOT_KEY) ?? false;
     this.gitName = shared(GIT_NAME_KEY) ?? "";
     this.gitEmail = shared(GIT_EMAIL_KEY) ?? "";
     this.apiKey = "";
@@ -155,6 +165,15 @@ export default class AgentSpawner extends View {
     this.isBuildingImage = false;
     this.uid = "1000";
     this.gid = "1000";
+
+    this.dockerSetupScriptInput = InputState.new({
+      value: this.dockerSetupScript,
+      placeholder: "e.g. apt-get update && apt-get install -y curl ca-certificates git",
+    });
+    this.dockerSetupScriptInput.on("change", (_e, cx) => {
+      this.dockerSetupScript = this.dockerSetupScriptInput.value();
+      cx.notify();
+    });
 
     this.dockerImageInput = InputState.new({
       value: this.dockerImage,
@@ -358,6 +377,11 @@ export default class AgentSpawner extends View {
   setDockerImage(img) {
     this.dockerImage = img;
     this.dockerImageInput.set_value(img);
+  }
+
+  setDockerSetupScript(script) {
+    this.dockerSetupScript = script;
+    this.dockerSetupScriptInput.set_value(script);
   }
 
   async browseFolder(cx) {
@@ -982,17 +1006,23 @@ export default class AgentSpawner extends View {
       const cleanAgent = (agent.key || agent.name || "agent").toLowerCase().replace(/[^a-z0-9_.-]/g, "-");
       const shortSuffix = Math.random().toString(36).slice(2, 6);
       const containerName = `herdr-agent-${cleanSpace}-${cleanAgent}-${shortSuffix}`;
+      const setupScript = this.dockerSetupScript.trim();
+      const needsRootSetup = setupScript.length > 0 || this.dockerRunAsRoot;
 
       const dockerCmd = [
         "docker", "run", "-it", "--rm",
         "--name", containerName,
         "--label", "herdr.agent=true",
         "--label", `herdr.space=${cleanSpace}`,
-        "--user", userSpec,
-        "-e", "HOME=/tmp",
         "-v", `${this.cwd}:/workspace`,
         "-w", "/workspace",
       ];
+
+      if (!needsRootSetup) {
+        dockerCmd.push("--user", userSpec, "-e", "HOME=/tmp");
+      } else {
+        dockerCmd.push("-e", "HOME=/root");
+      }
 
       // Option A: Mount host agent binary read-only (only when targeting local machine)
       if (this.binaryMode === "mount" && !targetMachine) {
@@ -1039,11 +1069,24 @@ export default class AgentSpawner extends View {
 
       dockerCmd.push(selectedImage);
 
-      // Option B: Auto-install on startup if binary is missing inside container
-      if (this.binaryMode === "install") {
+      // Wrapper script when setupScript is present, or binaryMode === "install", or dropping privileges
+      if (setupScript || this.binaryMode === "install" || (needsRootSetup && !this.dockerRunAsRoot)) {
         const prog = agent.run[0] || "agy";
-        const installScript = `if ! command -v ${prog} >/dev/null 2>&1; then curl -fsSL https://antigravity.google/cli/install.sh | bash && export PATH="$HOME/.local/bin:$PATH"; fi; exec "$@"`;
-        dockerCmd.push("sh", "-c", installScript, "sh", ...finalArgv);
+        let wrapper = "set -e; ";
+        if (setupScript) {
+          wrapper += `echo "==> Running pre-installation script..."; ${setupScript}; `;
+        }
+        if (this.binaryMode === "install") {
+          wrapper += `if ! command -v ${prog} >/dev/null 2>&1; then echo "==> Auto-installing ${prog}..."; if [ "${prog}" = "agy" ]; then (curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- -d /usr/local/bin) || (curl -fsSL https://antigravity.google/cli/install.sh | bash); else curl -fsSL https://antigravity.google/cli/install.sh | bash; fi; fi; `;
+        }
+        wrapper += 'export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"; ';
+        if (!this.dockerRunAsRoot) {
+          // Drop privileges to host UID
+          wrapper += `u=$(id -nu ${this.uid} 2>/dev/null) || { useradd -u ${this.uid} -m devuser 2>/dev/null && u=devuser; }; export HOME="$(getent passwd "$u" 2>/dev/null | cut -d: -f6 || echo /tmp)"; export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"; if command -v runuser >/dev/null 2>&1; then exec runuser -u "$u" -- "$@"; else exec su -p -s /bin/sh "$u" -- -c 'exec "$@"' sh "$@"; fi`;
+        } else {
+          wrapper += 'exec "$@"';
+        }
+        dockerCmd.push("sh", "-c", wrapper, "sh", ...finalArgv);
       } else {
         dockerCmd.push(...finalArgv);
       }
@@ -1066,6 +1109,8 @@ export default class AgentSpawner extends View {
     setShared(DOCKER_IMAGE_KEY, this.dockerImage.trim() || "herdr-agent:latest");
     setShared(DOCKER_CERTS_KEY, this.dockerMountCerts);
     setShared(DOCKER_BIN_MODE_KEY, this.binaryMode);
+    setShared(DOCKER_SETUP_SCRIPT_KEY, this.dockerSetupScript.trim());
+    setShared(DOCKER_RUN_AS_ROOT_KEY, this.dockerRunAsRoot);
     if (this.gitName.trim()) setShared(GIT_NAME_KEY, this.gitName.trim());
     if (this.gitEmail.trim()) setShared(GIT_EMAIL_KEY, this.gitEmail.trim());
 
@@ -1621,6 +1666,104 @@ export default class AgentSpawner extends View {
                             .child(this.renderBinModeButton("install", "Install on Start", "⬇️", "Auto-installs if missing"))
                         )
                     )
+                    // Pre-install / Setup Script Input + Presets
+                    .child(
+                      v_flex()
+                        .gap(4)
+                        .child(
+                          h_flex()
+                            .justify_between()
+                            .items_center()
+                            .child(div().text_size(11.5).font_medium().text_color(t.foreground).child("Pre-install Script (runs before agent):"))
+                            .child(
+                              h_flex()
+                                .gap(4)
+                                .children(
+                                  DOCKER_SETUP_PRESETS.map((p) =>
+                                    h_flex()
+                                      .px(6)
+                                      .py(2)
+                                      .rounded(4)
+                                      .bg(t.raised)
+                                      .border_1()
+                                      .border_color(t.border)
+                                      .cursor_pointer()
+                                      .hover((s) => s.bg(t.hover))
+                                      .on_click((_e, cx) => {
+                                        this.setDockerSetupScript(p.script);
+                                        cx.notify();
+                                      })
+                                      .child(div().text_size(10).text_color(t.foreground).child(p.label))
+                                  )
+                                )
+                                .when(Boolean(this.dockerSetupScript), (el) =>
+                                  el.child(
+                                    h_flex()
+                                      .px(6)
+                                      .py(2)
+                                      .rounded(4)
+                                      .bg(t.raised)
+                                      .cursor_pointer()
+                                      .hover((s) => s.bg(t.hover))
+                                      .on_click((_e, cx) => {
+                                        this.setDockerSetupScript("");
+                                        cx.notify();
+                                      })
+                                      .child(div().text_size(10).text_color(t.muted).child("✕ Clear"))
+                                  )
+                                )
+                            )
+                        )
+                        .child(
+                          Input.new(this.dockerSetupScriptInput)
+                            .h(30)
+                            .px(8)
+                            .rounded(6)
+                            .border_1()
+                            .border_color(t.input)
+                            .bg(t.background)
+                            .text_size(11.5)
+                            .text_color(t.foreground)
+                        )
+                        .child(
+                          div()
+                            .text_size(10.5)
+                            .text_color(t.dim)
+                            .child("Runs as root inside container. Use to install curl, git, python, etc. on minimal images.")
+                        )
+                    )
+                    // Run As Root Toggle
+                    .child(
+                      h_flex()
+                        .id("btn-toggle-root")
+                        .gap(6)
+                        .items_center()
+                        .cursor_pointer()
+                        .on_click((_e, cx) => {
+                          this.dockerRunAsRoot = !this.dockerRunAsRoot;
+                          cx.notify();
+                        })
+                        .child(
+                          div()
+                            .size(14)
+                            .rounded(3)
+                            .border_1()
+                            .border_color(this.dockerRunAsRoot ? t.accent : t.dim)
+                            .bg(this.dockerRunAsRoot ? t.accent : t.background)
+                            .items_center()
+                            .justify_center()
+                            .text_size(10)
+                            .font_bold()
+                            .text_color(t.solid_foreground)
+                            .child(this.dockerRunAsRoot ? "✓" : "")
+                        )
+                        .child(
+                          div()
+                            .text_size(11.5)
+                            .text_color(t.foreground)
+                            .child("Run agent as root (unchecked = drops to non-root host user after pre-install)")
+                        )
+                    )
                     // Volume Isolation Badge
                     .child(
                       h_flex()
@@ -1637,7 +1780,11 @@ export default class AgentSpawner extends View {
                             .truncate()
                             .text_size(11)
                             .text_color(t.muted)
-                            .child(`${this.cwd} → /workspace (Non-Root UID ${this.uid}:${this.gid})`)
+                            .child(
+                              this.dockerRunAsRoot
+                                ? `${this.cwd} → /workspace (Root UID 0)`
+                                : `${this.cwd} → /workspace (Non-Root UID ${this.uid}:${this.gid})`
+                            )
                         )
                     )
                     // Git Integration (Author Name & Email)
