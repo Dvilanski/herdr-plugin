@@ -97,27 +97,15 @@ function sanitizePath(raw) {
   return p;
 }
 
-function toBase64(str) {
-  if (typeof Buffer !== "undefined") {
-    return Buffer.from(str, "utf8").toString("base64");
+function quoteForShell(arg) {
+  if (typeof arg !== "string") return String(arg);
+  if ((arg.startsWith("'") && arg.endsWith("'")) || (arg.startsWith('"') && arg.endsWith('"'))) {
+    return arg;
   }
-  if (typeof btoa === "function") {
-    return btoa(unescape(encodeURIComponent(str)));
+  if (/[\s;|<>&"'$]/.test(arg)) {
+    return "'" + arg.replace(/'/g, "'\\''") + "'";
   }
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  let encoded = "";
-  let i = 0;
-  const bytes = new TextEncoder().encode(str);
-  while (i < bytes.length) {
-    const b1 = bytes[i++];
-    const b2 = i < bytes.length ? bytes[i++] : NaN;
-    const b3 = i < bytes.length ? bytes[i++] : NaN;
-    encoded += chars[b1 >> 2];
-    encoded += chars[((b1 & 3) << 4) | (isNaN(b2) ? 0 : b2 >> 4)];
-    encoded += isNaN(b2) ? "=" : chars[((b2 & 15) << 2) | (isNaN(b3) ? 0 : b3 >> 6)];
-    encoded += isNaN(b3) ? "=" : chars[b3 & 63];
-  }
-  return encoded;
+  return arg;
 }
 
 function getDockerMountPath(raw) {
@@ -1128,16 +1116,15 @@ export default class AgentSpawner extends View {
           script += `echo "==> Running pre-installation script..."\n${setupScript}\n`;
         }
         if (this.binaryMode === "install") {
-          script += `if ! command -v ${prog} >/dev/null 2>&1; then\n  echo "==> Auto-installing ${prog}..."\n  if [ "${prog}" = "agy" ]; then\n    (curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- -d /usr/local/bin) || (curl -fsSL https://antigravity.google/cli/install.sh | bash)\n  else\n    curl -fsSL https://antigravity.google/cli/install.sh | bash\n  fi\nfi\n`;
+          script += `if ! command -v ${prog} >/dev/null 2>&1; then\n  echo "==> Auto-installing ${prog}..."\n  if [ "${prog}" = "agy" ]; then\n    curl -fsSL https://antigravity.google/cli/install.sh -o /tmp/install-agy.sh && bash /tmp/install-agy.sh -d /usr/local/bin && rm -f /tmp/install-agy.sh\n  else\n    curl -fsSL https://antigravity.google/cli/install.sh | bash\n  fi\nfi\n`;
         }
         script += 'export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"\n';
         if (!this.dockerRunAsRoot) {
-          script += `u=$(id -nu ${this.uid} 2>/dev/null) || { useradd -u ${this.uid} -m devuser 2>/dev/null && u=devuser; }\nexport HOME="$(getent passwd "$u" 2>/dev/null | cut -d: -f6 || echo /tmp)"\nexport PATH="/usr/local/bin:$HOME/.local/bin:$PATH"\nif command -v runuser >/dev/null 2>&1; then\n  exec runuser -u "$u" -- "$@"\nelse\n  exec su -p -s /bin/sh "$u" -- -c 'exec "$@"' sh "$@"\nfi\n`;
+          script += `u=$(id -nu ${this.uid} 2>/dev/null) || { useradd -u ${this.uid} -m devuser 2>/dev/null && u=devuser; }\nexport HOME="/home/$u"\nexport PATH="/usr/local/bin:$HOME/.local/bin:$PATH"\nif command -v runuser >/dev/null 2>&1; then\n  exec runuser -u "$u" -- "$@"\nelse\n  exec su -p -s /bin/sh "$u" -- -c 'exec "$@"' sh "$@"\nfi\n`;
         } else {
           script += 'exec "$@"\n';
         }
-        const b64 = toBase64(script);
-        dockerCmd.push("sh", "-c", `echo ${b64} | base64 -d | sh -s -- "$@"`, "sh", ...finalArgv);
+        dockerCmd.push("sh", "-c", script, "sh", ...finalArgv);
       } else {
         dockerCmd.push(...finalArgv);
       }
@@ -1161,12 +1148,15 @@ export default class AgentSpawner extends View {
           }
           return arg;
         });
-        finalArgv = ["wsl.exe", "-d", distro, "--", ...finalArgv];
+        finalArgv = ["wsl.exe", "-d", distro, "--cd", linuxPath, "-e", ...finalArgv];
       } else {
         // Direct execution on host inside the WSL distro at project directory
-        finalArgv = ["wsl.exe", "-d", distro, "--cd", linuxPath, "--", ...finalArgv];
+        finalArgv = ["wsl.exe", "-d", distro, "--cd", linuxPath, "-e", ...finalArgv];
       }
     }
+
+    // Safely quote arguments to protect against shell word-splitting and delimiter parsing
+    finalArgv = finalArgv.map(quoteForShell);
 
     // Save history & preferences
     if (task) {
